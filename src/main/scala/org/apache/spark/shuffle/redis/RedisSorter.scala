@@ -18,6 +18,7 @@ import scala.reflect.ClassTag
   */
 class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
   jedis: Jedis,
+  shuffleId: Int,
   mapId: Int,
   context: TaskContext,
   aggregator: Option[Aggregator[K, V, C]] = None,
@@ -27,7 +28,6 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
   extends Spillable[WritablePartitionedPairCollection[K, C]](context.taskMemoryManager())
     with Logging {
 
-  private val mapKey = s"SHUFFLE_${mapId}_KEYS".getBytes
   private val serialize = serializer.newInstance()
 
   private val numPartitions = partitioner.map(_.numPartitions).getOrElse(1)
@@ -83,22 +83,26 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
       spill(map) // force spill remaining data
 
       // combine the spilled data
-      val keys = jedis.smembers(mapKey).asScala
-      keys.foreach { key: Array[Byte] =>
-        var combinedStr = jedis.lpop(key)
-        var combined = serialize.deserialize[C](ByteBuffer.wrap(combinedStr))
-        var valueStr = jedis.lpop(key)
-        while (valueStr != null) {
-          val value = serialize.deserialize[C](ByteBuffer.wrap(valueStr))
-          combined = aggregator.get.mergeCombiners(combined, value)
-          valueStr = jedis.lpop(key)
-        }
+      (0 until numPartitions).foreach { partition =>
+        val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
+        val keys = jedis.smembers(mapKey).asScala
+        keys.foreach { key: Array[Byte] =>
+          val fullKey = RedisShuffleManager.fullKey(shuffleId, mapId, partition, key)
+          var combinedStr = jedis.lpop(fullKey)
+          var combined = serialize.deserialize[C](ByteBuffer.wrap(combinedStr))
+          var valueStr = jedis.lpop(fullKey)
+          while (valueStr != null) {
+            val value = serialize.deserialize[C](ByteBuffer.wrap(valueStr))
+            combined = aggregator.get.mergeCombiners(combined, value)
+            valueStr = jedis.lpop(fullKey)
+          }
 
-        combinedStr = serialize.serialize(combined).array()
-        jedis.lpush(key, combinedStr)
-        val partitionId = getPartitionFromKey(key)
-        partitionLengths(partitionId) += combinedStr.length
+          combinedStr = serialize.serialize(combined).array()
+          jedis.lpush(fullKey, combinedStr)
+          partitionLengths(partition) += combinedStr.length
+        }
       }
+
     } else {
       // directly store to the list in Redis
       while (records.hasNext) {
@@ -123,24 +127,19 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
     }
   }
 
-  private def getPartitionFromKey(key: Array[Byte]): Int = {
-    val str = new String(key)
-    str.split(":")(2).toInt
-  }
-
-  private def put[T: ClassTag](partition: Int, key: K, value: T): Long = {
+  private def put[T: ClassTag](partition: Int, k: K, v: T): Long = {
     require(partition >= 0 && partition < numPartitions,
       s"partition Id: ${partition} should be in the range [0, ${numPartitions})")
 
-    val prefix = s"SHUFFLE:${mapId}:${partition}:".getBytes
-    val keySer = serialize.serialize(key: K).array()
-    val keyStr = new Array[Byte](prefix.length + keySer.length)
-    System.arraycopy(prefix, 0, keyStr, 0, prefix.length)
-    System.arraycopy(keySer, 0, keyStr, prefix.length, keySer.length)
-    val valueSer = serialize.serialize(value).array()
-    jedis.lpush(keyStr, valueSer) // just push to a list
-    jedis.sadd(mapKey, keyStr) // add this key to a set for clear jobs
-    valueSer.length
+    val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
+
+    val key = serialize.serialize(k: K).array()
+    val fullKey = RedisShuffleManager.fullKey(shuffleId, mapId, partition, key)
+
+    val value = serialize.serialize(v).array()
+    jedis.lpush(fullKey, value) // just push to a list
+    jedis.sadd(mapKey, key) // add this key (without prefix) to a set for query
+    value.length
   }
 
   override protected def spill(collection: WritablePartitionedPairCollection[K, C]): Unit = {
@@ -157,9 +156,14 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
     false
   }
 
-  def close(): Unit = {
-    val keys = jedis.smembers(mapKey).asScala.toSeq
-    jedis.del(keys:_*)
-    jedis.del(mapKey)
+  /**
+    * clean Redis if error occurs
+    */
+  def clean(): Unit = {
+    RedisShuffleManager.mapKeyIter(shuffleId, mapId, numPartitions).foreach { mapKey =>
+      val keys = jedis.smembers(mapKey).asScala.toSeq
+      if (keys.nonEmpty) jedis.del(keys:_*)
+      jedis.del(mapKey)
+    }
   }
 }

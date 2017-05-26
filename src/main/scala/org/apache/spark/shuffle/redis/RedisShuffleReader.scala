@@ -29,30 +29,76 @@ private[spark] class RedisShuffleReader[K, C](
   val serialize = handle.dependency.serializer.newInstance()
 
   override def read(): Iterator[Product2[K, C]] = {
+    val shuffleId = handle.shuffleId
     val blocks = mapOutputTracker.getMapSizesByExecutorId(
       handle.shuffleId, startPartition, endPartition)
-
-    blocks.toIterator.flatMap { block =>
-      val host = block._1.host
-      val jedis = new Jedis(host)
-      val kv = block._2.toIterator.flatMap { mapTask =>
-        val mapId = mapTask._1.asInstanceOf[ShuffleBlockId].mapId
-        val mapKey = s"SHUFFLE_${mapId}_KEYS".getBytes
-        val keys = jedis.smembers(mapKey)
-        keys.iterator.asScala.flatMap {key =>
-          val keyPos = key.lastIndexOf(":")
-          val keyStr = key.slice(keyPos+1, key.length)
-          val k: K = serialize.deserialize(ByteBuffer.wrap(keyStr))
-          val count = jedis.llen(key)
-          (0L until count.longValue()).toIterator.map {_ =>
-            val valueStr = jedis.get(key)
-            val value: C = serialize.deserialize(ByteBuffer.wrap(valueStr))
-            (k, value)
+    val grouped = blocks.groupBy(_._1.host).map {b => {
+      val all = b._2.flatMap { block =>
+        block._2.flatMap { mapTask =>
+          val size = mapTask._2
+          if (size > 0) {
+            val partition = mapTask._1.asInstanceOf[ShuffleBlockId].reduceId
+            val mapId = mapTask._1.asInstanceOf[ShuffleBlockId].mapId
+            Some((partition, mapId, size))
+          } else {
+            None
           }
         }
       }
-      jedis.close()
-      kv
+      (b._1, all)
+    }}
+
+    val iters = grouped.map { block =>
+      new Iterator[(K, C)] {
+        val host = block._1
+        var jedis: Jedis = null
+        var kv: Iterator[(K, C)] = Iterator.empty
+        var first = true
+
+        override def hasNext: Boolean = {
+          if (first) {
+            //initialize, may be we need to check the thread safety
+            first = false
+            jedis = new Jedis(host)
+            kv = block._2.toIterator.flatMap { mapTask =>
+              val partition = mapTask._1
+              val mapId = mapTask._2
+              val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
+              val keys = jedis.smembers(mapKey)
+              keys.iterator.asScala.flatMap {key =>
+                val fullKey = RedisShuffleManager.fullKey(shuffleId, mapId, partition, key)
+                val k: K = serialize.deserialize(ByteBuffer.wrap(key))
+                val count = jedis.llen(fullKey)
+                (0L until count.longValue()).toIterator.flatMap {_ =>
+                  val value = jedis.rpoplpush(fullKey, fullKey) // move to the end to avoid deletion
+                  if (value == null) None
+                  else {
+                    val v: C = serialize.deserialize(ByteBuffer.wrap(value))
+                    Some((k, v))
+                  }
+                }
+              }
+            }
+
+            kv.hasNext
+          } else {
+            jedis != null && kv.hasNext
+          }
+        }
+
+        override def next(): (K, C) = {
+          try {
+            kv.next()
+          } finally {
+            if (!hasNext && jedis != null) {
+              jedis.close()
+              jedis = null
+            }
+          }
+        }
+      }
     }
+    iters.foldLeft(Iterator[(K, C)]())(_ ++ _)
   }
+
 }

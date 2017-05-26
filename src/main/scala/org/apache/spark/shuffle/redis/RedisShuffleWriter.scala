@@ -4,7 +4,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.shuffle.{ShuffleHandle, ShuffleWriter}
 import org.apache.spark.{SparkEnv, TaskContext}
-import redis.clients.jedis.Jedis
+import redis.clients.jedis.{Jedis, JedisPool}
 
 class RedisShuffleWriter[K, V](
   handle: ShuffleHandle,
@@ -16,7 +16,7 @@ class RedisShuffleWriter[K, V](
 
   private val blockManager = SparkEnv.get.blockManager
 
-  private var output: Jedis = null
+  private val jedisPool = new JedisPool()
 
   private var sorter: RedisSorter[Any, Any, Any] = null
 
@@ -30,25 +30,32 @@ class RedisShuffleWriter[K, V](
   /** Write a bunch of records to this task's output */
   override def write(records: Iterator[Product2[K, V]]): Unit = {
 
-    sorter.insertAll(records)
+    var output: Jedis = null
+    try {
+      output = jedisPool.getResource
+      sorter = if (dep.mapSideCombine) {
+        require(dep.aggregator.isDefined, "Map-side combine without Aggregator specified!")
+        new RedisSorter(
+          output, handle.shuffleId, mapId, context, dep.aggregator,
+          Some(dep.partitioner), dep.keyOrdering, dep.serializer)
+      } else {
+        // In this case we pass neither an aggregator nor an ordering to the sorter, because we don't
+        // care whether the keys get sorted in each partition; that will be done on the reduce side
+        // if the operation being run is sortByKey.
+        new RedisSorter(
+          output, handle.shuffleId, mapId, context, None,
+          Some(dep.partitioner), None, dep.serializer)
+      }
 
-    output = new Jedis
-    sorter = if (dep.mapSideCombine) {
-      require(dep.aggregator.isDefined, "Map-side combine without Aggregator specified!")
-      new RedisSorter(
-        output, mapId, context, dep.aggregator,
-        Some(dep.partitioner), dep.keyOrdering, dep.serializer)
-    } else {
-      // In this case we pass neither an aggregator nor an ordering to the sorter, because we don't
-      // care whether the keys get sorted in each partition; that will be done on the reduce side
-      // if the operation being run is sortByKey.
-      new RedisSorter(
-        output, mapId, context, None, Some(dep.partitioner), None, dep.serializer)
+      val partitionLengths = sorter.insertAll(records)
+      mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths)
+
+    } finally {
+      if (output != null) {
+        output.close()
+        output = null
+      }
     }
-
-    val partitionLengths = sorter.insertAll(records)
-    mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths)
-
   }
 
   /** Close this writer, passing along whether the map completed */
@@ -61,15 +68,14 @@ class RedisShuffleWriter[K, V](
       if (success) {
         return Option(mapStatus)
       } else {
+        if (sorter != null) {
+          sorter.clean()
+          sorter = null
+        }
         return None
       }
     } finally {
-      if (output != null) {
-        output.close()
-      }
-      if (sorter != null) {
-        sorter.close()
-      }
+      jedisPool.close()
     }
   }
 }
