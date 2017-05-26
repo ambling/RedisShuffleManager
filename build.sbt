@@ -9,6 +9,8 @@ val hadoopVersion = "2.7.1"
 
 val sparkVersion = "2.1.0"
 
+test in assembly := {}
+
 licenses += "Apache-2.0" -> url("http://www.apache.org/licenses/LICENSE-2.0.html")
 
 resolvers += "mvnrepository" at "http://mvnrepository.com/artifact/"
