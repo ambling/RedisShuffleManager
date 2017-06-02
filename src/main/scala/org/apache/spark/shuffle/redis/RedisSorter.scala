@@ -35,11 +35,11 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
   private def getPartition(key: K): Int = {
     if (shouldPartition) partitioner.get.getPartition(key) else 0
   }
+  val partitionLengths = new Array[Long](numPartitions)
 
   private var _peakMemoryUsedBytes: Long = 0L
 
   @volatile private var map = new PartitionedAppendOnlyMap[K, C]
-  @volatile private var buffer = new PartitionedPairBuffer[K, C]
 
   // A comparator for keys K that orders them within a partition to allow aggregation or sorting.
   // Can be a partial ordering by hash code if a total ordering is not provided through by the
@@ -65,7 +65,7 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
   def insertAll(records: Iterator[Product2[Any, Any]]): Array[Long] = {
     val shouldCombine = aggregator.isDefined
 
-    val partitionLengths = new Array[Long](numPartitions)
+    for (i <- 0 until partitionLengths.length) partitionLengths(i) = 0
 
     if (shouldCombine) {
       // Combine values in-memory first using our AppendOnlyMap
@@ -82,26 +82,8 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
       }
       spill(map) // force spill remaining data
 
-      // combine the spilled data
-      (0 until numPartitions).foreach { partition =>
-        val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
-        val keys = jedis.smembers(mapKey).asScala
-        keys.foreach { key: Array[Byte] =>
-          val fullKey = RedisShuffleManager.fullKey(shuffleId, mapId, partition, key)
-          var combinedStr = jedis.lpop(fullKey)
-          var combined = serialize.deserialize[C](ByteBuffer.wrap(combinedStr))
-          var valueStr = jedis.lpop(fullKey)
-          while (valueStr != null) {
-            val value = serialize.deserialize[C](ByteBuffer.wrap(valueStr))
-            combined = aggregator.get.mergeCombiners(combined, value)
-            valueStr = jedis.lpop(fullKey)
-          }
+      // TODO combine the spilled data to save network transfer
 
-          combinedStr = serialize.serialize(combined).array()
-          jedis.lpush(fullKey, combinedStr)
-          partitionLengths(partition) += combinedStr.length
-        }
-      }
 
     } else {
       // directly store to the list in Redis
@@ -109,7 +91,7 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
         val kv = records.next().asInstanceOf[Product2[K, V]]
         val partitionId = getPartition(kv._1)
         val length = put(partitionId, kv._1, kv._2)
-        partitionLengths(partitionId) += length
+        partitionLengths(partitionId) += length // add to partition length
       }
     }
     partitionLengths
@@ -132,14 +114,9 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
       s"partition Id: ${partition} should be in the range [0, ${numPartitions})")
 
     val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
-
-    val key = serialize.serialize(k: K).array()
-    val fullKey = RedisShuffleManager.fullKey(shuffleId, mapId, partition, key)
-
-    val value = serialize.serialize(v).array()
-    jedis.lpush(fullKey, value) // just push to a list
-    jedis.sadd(mapKey, key) // add this key (without prefix) to a set for query
-    value.length
+    val data = RedisShuffleManager.serializePair(serialize, k, v)
+    jedis.rpush(mapKey, data)
+    data.length
   }
 
   override protected def spill(collection: WritablePartitionedPairCollection[K, C]): Unit = {
@@ -148,7 +125,8 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
     while (inMemoryIterator.hasNext) {
       val nextItem = inMemoryIterator.next()
       val ((partitionId, key), value) = nextItem
-      put(partitionId, key, value)
+      val length = put(partitionId, key, value)
+      partitionLengths(partitionId) += length // add to partition length
     }
   }
 
@@ -161,8 +139,6 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
     */
   def clean(): Unit = {
     RedisShuffleManager.mapKeyIter(shuffleId, mapId, numPartitions).foreach { mapKey =>
-      val keys = jedis.smembers(mapKey).asScala.toSeq
-      if (keys.nonEmpty) jedis.del(keys:_*)
       jedis.del(mapKey)
     }
   }

@@ -1,16 +1,13 @@
 package org.apache.spark.shuffle.redis
 
-import java.nio.ByteBuffer
-
 import org.apache.spark.internal.Logging
 import org.apache.spark.serializer.SerializerManager
 import org.apache.spark.shuffle.ShuffleReader
 import org.apache.spark.storage.{BlockManager, ShuffleBlockId}
-import org.apache.spark.{MapOutputTracker, SparkEnv, TaskContext}
+import org.apache.spark.util.CompletionIterator
+import org.apache.spark.util.collection.ExternalSorter
+import org.apache.spark.{InterruptibleIterator, MapOutputTracker, SparkEnv, TaskContext}
 import redis.clients.jedis.Jedis
-
-import scala.collection.JavaConverters._
-
 
 /**
   * Fetches and reads the partitions in range [startPartition, endPartition) from a shuffle by
@@ -27,6 +24,7 @@ private[spark] class RedisShuffleReader[K, C](
   extends ShuffleReader[K, C] with Logging {
 
   val serialize = handle.dependency.serializer.newInstance()
+  private val dep = handle.dependency
 
   override def read(): Iterator[Product2[K, C]] = {
     val shuffleId = handle.shuffleId
@@ -64,18 +62,13 @@ private[spark] class RedisShuffleReader[K, C](
               val partition = mapTask._1
               val mapId = mapTask._2
               val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
-              val keys = jedis.smembers(mapKey)
-              keys.iterator.asScala.flatMap {key =>
-                val fullKey = RedisShuffleManager.fullKey(shuffleId, mapId, partition, key)
-                val k: K = serialize.deserialize(ByteBuffer.wrap(key))
-                val count = jedis.llen(fullKey)
-                (0L until count.longValue()).toIterator.flatMap {_ =>
-                  val value = jedis.rpoplpush(fullKey, fullKey) // move to the end to avoid deletion
-                  if (value == null) None
-                  else {
-                    val v: C = serialize.deserialize(ByteBuffer.wrap(value))
-                    Some((k, v))
-                  }
+              val length = jedis.llen(mapKey)
+              (0L until length).toIterator.flatMap { idx =>
+                val data = jedis.rpoplpush(mapKey, mapKey)
+                if (data == null) None
+                else {
+                  val (k, v) = RedisShuffleManager.deserializePair[K, C](serialize, data)
+                  Some((k, v))
                 }
               }
             }
@@ -98,7 +91,54 @@ private[spark] class RedisShuffleReader[K, C](
         }
       }
     }
-    iters.foldLeft(Iterator[(K, C)]())(_ ++ _)
+    val recordIter = iters.foldLeft(Iterator[(K, C)]())(_ ++ _)
+
+    // The rest code are copied from Spark's BlockStoreShuffleReader, maybe we can reuse it
+
+    // Update the context task metrics for each record read.
+    val readMetrics = context.taskMetrics.createTempShuffleReadMetrics()
+    val metricIter = CompletionIterator[(Any, Any), Iterator[(Any, Any)]](
+      recordIter.map { record =>
+        readMetrics.incRecordsRead(1)
+        record
+      },
+      context.taskMetrics().mergeShuffleReadMetrics())
+
+    // An interruptible iterator must be used here in order to support task cancellation
+    val interruptibleIter = new InterruptibleIterator[(Any, Any)](context, metricIter)
+
+    val aggregatedIter: Iterator[Product2[K, C]] = if (dep.aggregator.isDefined) {
+      if (dep.mapSideCombine) {
+        // We are reading values that are already combined
+        val combinedKeyValuesIterator = interruptibleIter.asInstanceOf[Iterator[(K, C)]]
+        dep.aggregator.get.combineCombinersByKey(combinedKeyValuesIterator, context)
+      } else {
+        // We don't know the value type, but also don't care -- the dependency *should*
+        // have made sure its compatible w/ this aggregator, which will convert the value
+        // type to the combined type C
+        val keyValuesIterator = interruptibleIter.asInstanceOf[Iterator[(K, Nothing)]]
+        dep.aggregator.get.combineValuesByKey(keyValuesIterator, context)
+      }
+    } else {
+      require(!dep.mapSideCombine, "Map-side combine without Aggregator specified!")
+      interruptibleIter.asInstanceOf[Iterator[Product2[K, C]]]
+    }
+
+    // Sort the output if there is a sort ordering defined.
+    dep.keyOrdering match {
+      case Some(keyOrd: Ordering[K]) =>
+        // Create an ExternalSorter to sort the data. Note that if spark.shuffle.spill is disabled,
+        // the ExternalSorter won't spill to disk.
+        val sorter =
+          new ExternalSorter[K, C, C](context, ordering = Some(keyOrd), serializer = dep.serializer)
+        sorter.insertAll(aggregatedIter)
+        context.taskMetrics().incMemoryBytesSpilled(sorter.memoryBytesSpilled)
+        context.taskMetrics().incDiskBytesSpilled(sorter.diskBytesSpilled)
+        context.taskMetrics().incPeakExecutionMemory(sorter.peakMemoryUsedBytes)
+        CompletionIterator[Product2[K, C], Iterator[Product2[K, C]]](sorter.iterator, sorter.stop())
+      case None =>
+        aggregatedIter
+    }
   }
 
 }

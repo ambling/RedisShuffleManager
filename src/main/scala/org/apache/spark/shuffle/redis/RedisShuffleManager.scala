@@ -1,5 +1,6 @@
 package org.apache.spark.shuffle.redis
 
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 
@@ -7,8 +8,10 @@ import org.apache.spark.{ShuffleDependency, SparkConf, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.shuffle._
 import _root_.redis.clients.jedis.Jedis
+import org.apache.spark.serializer.SerializerInstance
 
 import scala.collection.JavaConverters._
+import scala.reflect.ClassTag
 
 /**
   * A shuffler manager that support using local Redis store instead of Spark's BlockStore.
@@ -51,14 +54,8 @@ class RedisShuffleManager(conf: SparkConf) extends ShuffleManager with Logging {
       maps.asScala.foreach { map =>
         val mapId = map._1
         val numPartition = map._2
-        (0 until numPartition).foreach { partition =>
-          val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
-          val keys = jedis.smembers(mapKey).asScala.toSeq
-          keys.foreach { key =>
-            val fullKey = RedisShuffleManager.fullKey(shuffleId, mapId, partition, key)
-            jedis.del(fullKey)
-          }
-          jedis.del(mapKey)
+        RedisShuffleManager.mapKeyIter(shuffleId, mapId, numPartition).foreach { key =>
+          jedis.del(key)
         }
       }
     }
@@ -79,10 +76,10 @@ class RedisShuffleManager(conf: SparkConf) extends ShuffleManager with Logging {
 object RedisShuffleManager {
 
   def mapKeyPrefix(shuffleId: Int, mapId: Int) =
-    s"SHUFFLE_KEYS_${shuffleId}_${mapId}_"
+    s"SHUFFLE_${shuffleId}_${mapId}_"
 
   def mapKey(shuffleId: Int, mapId: Int, partition: Int) =
-    s"SHUFFLE_KEYS_${shuffleId}_${mapId}_${partition}".getBytes()
+    s"SHUFFLE_${shuffleId}_${mapId}_${partition}".getBytes()
 
   def mapKeyIter(shuffleId: Int, mapId: Int, numPartitions: Int): Iterator[Array[Byte]] = {
     (0 until numPartitions).toIterator.map { partition =>
@@ -90,25 +87,23 @@ object RedisShuffleManager {
     }
   }
 
-  def keyPrefix(shuffleId: Int, mapId: Int, partition: Int): Array[Byte] = {
-    //"SHUFFLE:${shuffleId}:${mapId}:${partition}:"
-    val prefix = ByteBuffer.allocate(8+4+1+4+1+4+1)
-    prefix.put("SHUFFLE:".getBytes)
-      .putInt(shuffleId).put(':'.toByte)
-      .putInt(mapId).put(':'.toByte)
-      .putInt(partition).put(':'.toByte)
-    prefix.array()
+  def serializePair[K: ClassTag, V: ClassTag](serializer: SerializerInstance,
+                                              key: K, value: V): Array[Byte] = {
+    val baos = new ByteArrayOutputStream()
+    val sstream = serializer.serializeStream(baos)
+    sstream.writeKey(key)
+    sstream.writeValue(value)
+    sstream.flush()
+    sstream.close()
+    baos.toByteArray
   }
 
-  def fullKey(shuffleId: Int, mapId: Int, partition: Int, key: Array[Byte]): Array[Byte] = {
-    val prefix = keyPrefix(shuffleId, mapId, partition)
-    mergeKey(prefix, key)
-  }
-
-  def mergeKey(prefix: Array[Byte], key: Array[Byte]): Array[Byte] = {
-    val keyStr = new Array[Byte](prefix.length + key.length)
-    System.arraycopy(prefix, 0, keyStr, 0, prefix.length)
-    System.arraycopy(key, 0, keyStr, prefix.length, key.length)
-    keyStr
+  def deserializePair[K, V](serializer: SerializerInstance, data: Array[Byte]): (K, V) = {
+    val bais = new ByteArrayInputStream(data)
+    val sstream = serializer.deserializeStream(bais)
+    val key: K = sstream.readKey()
+    val value: V = sstream.readValue()
+    sstream.close()
+    (key, value)
   }
 }
