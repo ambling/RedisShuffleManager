@@ -1,15 +1,13 @@
 package org.apache.spark.shuffle.redis
 
-import java.nio.ByteBuffer
 import java.util.Comparator
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.serializer.Serializer
-import org.apache.spark.util.collection.{PartitionedAppendOnlyMap, PartitionedPairBuffer, Spillable, WritablePartitionedPairCollection}
+import org.apache.spark.util.collection.{PartitionedAppendOnlyMap, Spillable, WritablePartitionedPairCollection}
 import org.apache.spark.{Aggregator, Partitioner, SparkEnv, TaskContext}
-import redis.clients.jedis.Jedis
+import redis.clients.jedis.{Jedis, Pipeline}
 
-import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
 
 /**
@@ -87,12 +85,21 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
 
     } else {
       // directly store to the list in Redis
+      var syncCnt = 0
+      var pipe = jedis.pipelined()
       while (records.hasNext) {
         val kv = records.next().asInstanceOf[Product2[K, V]]
         val partitionId = getPartition(kv._1)
-        val length = put(partitionId, kv._1, kv._2)
+        val length = put(pipe, partitionId, kv._1, kv._2)
         partitionLengths(partitionId) += length // add to partition length
+        syncCnt += 1
+        if (syncCnt >= 10000) {
+          syncCnt = 0
+          pipe.sync()
+          pipe = jedis.pipelined()
+        }
       }
+      pipe.sync()
     }
     partitionLengths
   }
@@ -109,25 +116,27 @@ class RedisSorter[K: ClassTag, V: ClassTag, C: ClassTag](
     }
   }
 
-  private def put[T: ClassTag](partition: Int, k: K, v: T): Long = {
+  private def put[T: ClassTag](pipe: Pipeline, partition: Int, k: K, v: T): Long = {
     require(partition >= 0 && partition < numPartitions,
       s"partition Id: ${partition} should be in the range [0, ${numPartitions})")
 
     val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
     val data = RedisShuffleManager.serializePair(serialize, k, v)
-    jedis.rpush(mapKey, data)
+    pipe.rpush(mapKey, data)
     data.length
   }
 
   override protected def spill(collection: WritablePartitionedPairCollection[K, C]): Unit = {
     val inMemoryIterator = collection.partitionedDestructiveSortedIterator(comparator)
 
+    val pipe = jedis.pipelined()
     while (inMemoryIterator.hasNext) {
       val nextItem = inMemoryIterator.next()
       val ((partitionId, key), value) = nextItem
-      val length = put(partitionId, key, value)
+      val length = put(pipe, partitionId, key, value)
       partitionLengths(partitionId) += length // add to partition length
     }
+    pipe.sync()
   }
 
   override protected def forceSpill(): Boolean = {

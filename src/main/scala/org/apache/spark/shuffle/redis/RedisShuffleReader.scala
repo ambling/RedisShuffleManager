@@ -63,14 +63,24 @@ private[spark] class RedisShuffleReader[K, C](
               val mapId = mapTask._2
               val mapKey = RedisShuffleManager.mapKey(shuffleId, mapId, partition)
               val length = jedis.llen(mapKey)
-              (0L until length).toIterator.flatMap { idx =>
-                val data = jedis.rpoplpush(mapKey, mapKey)
-                if (data == null) None
-                else {
-                  val (k, v) = RedisShuffleManager.deserializePair[K, C](serialize, data)
-                  Some((k, v))
+
+              val iters = for (start <- 0L until length by 10000) yield {
+                val pipe = jedis.pipelined()
+                val end = Math.min(start + 10000, length)
+                val response = (start until end).map(idx => pipe.rpoplpush(mapKey, mapKey))
+                pipe.sync()
+                response.toIterator.flatMap { res =>
+                  val data = res.get
+                  if (data == null) None
+                  else {
+                    val (k, v) = RedisShuffleManager.deserializePair[K, C](serialize, data)
+                    Some((k, v))
+                  }
                 }
               }
+
+              iters.foldLeft(Iterator[(K, C)]())(_ ++ _)
+
             }
 
             kv.hasNext
